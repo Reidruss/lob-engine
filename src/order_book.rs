@@ -37,7 +37,8 @@ impl OrderBook {
 
     pub fn submit_limit_order(&mut self, mut order: Order) -> Quantity {
         order.order_id = self.assign_id();
-        self.event_store.append(OrderEvent::OrderPlaced(order));
+        self.event_store
+            .append(OrderEvent::OrderPlaced(order.clone()));
         let remaining = self.match_order(order);
         self.check_stop_orders();
         remaining
@@ -51,17 +52,10 @@ impl OrderBook {
         iceberg.remaining -= visible;
         self.iceberg_meta.insert(id, iceberg.clone());
 
-        let order = Order {
-            order_id: id,
-            side: iceberg.side,
-            order_type: OrderType::Limit,
-            price: iceberg.price,
-            original_quantity: visible,
-            remaining_quantity: visible,
-            timestamp: 0,
-        };
+        let order = Order::new(id, iceberg.side, OrderType::Limit, iceberg.price, visible);
 
-        self.event_store.append(OrderEvent::OrderPlaced(order));
+        self.event_store
+            .append(OrderEvent::OrderPlaced(order.clone()));
         let remaining = self.match_order(order);
         self.check_stop_orders();
         remaining
@@ -72,11 +66,12 @@ impl OrderBook {
         self.stop_orders.push(stop);
     }
 
-    fn match_order(&mut self, mut order: Order) -> Quantity {
+    fn match_order(&mut self, order: Order) -> Quantity {
         let initial_quantity = order.original_quantity;
         let event_store = &mut self.event_store;
         let iceberg_meta = &mut self.iceberg_meta;
         let last_trade = &mut self.last_trade_price;
+        let mut taker_remaining = order.get_remaining_quantity();
 
         let (own_side, other_side) = match order.side {
             Side::Bid => (&mut self.bids, &mut self.asks),
@@ -88,7 +83,7 @@ impl OrderBook {
             Side::Ask => Side::Bid,
         };
 
-        while order.original_quantity > 0 {
+        while taker_remaining > 0 {
             if let Some(best_price) = other_side.best_price(opposite) {
                 let should_match = match order.side {
                     Side::Bid => order.price >= best_price,
@@ -99,17 +94,19 @@ impl OrderBook {
                 }
 
                 if let Some(level) = other_side.levels.get_mut(&best_price) {
-                    while let Some(mut resting) = level.pop_front() {
-                        let traded = resting.original_quantity.min(order.original_quantity);
-                        resting.original_quantity -= traded;
-                        order.original_quantity -= traded;
+                    while let Some(resting) = level.pop_front() {
+                        let resting_remaining = resting.get_remaining_quantity();
+                        let traded = resting_remaining.min(taker_remaining);
+                        let resting_filled = resting.fill(traded);
+                        let _taker_filled = order.fill(resting_filled);
+                        taker_remaining = order.get_remaining_quantity();
 
                         *last_trade = Some(best_price);
 
-                        if resting.original_quantity > 0 {
+                        if resting.get_remaining_quantity() > 0 {
                             event_store.append(OrderEvent::OrderPartiallyFilled {
                                 id: resting.order_id,
-                                filled: traded,
+                                filled: resting_filled,
                             });
                             level.orders.push_front(resting);
                             break;
@@ -122,15 +119,13 @@ impl OrderBook {
                                     let new_visible = meta.visible_quantity.min(meta.remaining);
                                     meta.remaining -= new_visible;
 
-                                    let refill = Order {
-                                        order_id: resting.order_id,
-                                        side: resting.side,
-                                        order_type: OrderType::Limit,
-                                        price: resting.price,
-                                        original_quantity: new_visible,
-                                        remaining_quantity: new_visible,
-                                        timestamp: resting.timestamp,
-                                    };
+                                    let refill = Order::new(
+                                        resting.order_id,
+                                        resting.side,
+                                        OrderType::Limit,
+                                        resting.price,
+                                        new_visible,
+                                    );
 
                                     level.orders.push_back(refill);
                                     event_store.append(OrderEvent::IcebergRevealed(
@@ -141,7 +136,7 @@ impl OrderBook {
                             }
                         }
 
-                        if order.original_quantity == 0 {
+                        if taker_remaining == 0 {
                             break;
                         }
                     }
@@ -152,9 +147,9 @@ impl OrderBook {
             }
         }
 
-        let filled = initial_quantity - order.original_quantity;
+        let filled = initial_quantity - taker_remaining;
 
-        if order.original_quantity > 0 {
+        if taker_remaining > 0 {
             if filled > 0 {
                 event_store.append(OrderEvent::OrderPartiallyFilled {
                     id: order.order_id,
@@ -169,7 +164,7 @@ impl OrderBook {
             event_store.append(OrderEvent::OrderFullyFilled(order.order_id));
         }
 
-        order.original_quantity
+        taker_remaining
     }
 
     fn check_stop_orders(&mut self) {
@@ -201,18 +196,16 @@ impl OrderBook {
 
             for stop in triggered {
                 self.event_store.append(OrderEvent::StopTriggered(stop.id));
-                let order = Order {
-                    order_id: stop.id,
-                    side: stop.side,
-                    order_type: OrderType::Market,
-                    price: match stop.side {
+                let order = Order::new(
+                    stop.id,
+                    stop.side,
+                    OrderType::Market,
+                    match stop.side {
                         Side::Bid => Price::MAX,
                         Side::Ask => 0,
                     },
-                    original_quantity: stop.quantity,
-                    remaining_quantity: stop.quantity,
-                    timestamp: 0,
-                };
+                    stop.quantity,
+                );
                 self.match_order(order);
             }
         }
